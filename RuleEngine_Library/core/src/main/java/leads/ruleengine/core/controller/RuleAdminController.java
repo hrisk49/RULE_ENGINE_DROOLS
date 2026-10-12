@@ -25,10 +25,13 @@ import java.util.List;
  * Runtime rule management for the Visual Rule Builder and for hand-written DRL.
  *
  * <ul>
- *   <li>{@code GET  /admin/rules} - list stored rules.</li>
- *   <li>{@code POST /admin/rules} - save a rule (BUILDER JSON or DRL). A bad rule is rejected
- *       (400) without disturbing the live engine.</li>
- *   <li>{@code DELETE /admin/rules/{ruleName}} - deactivate a rule.</li>
+ *   <li>{@code GET  /admin/rules} - list stored rule versions (live, draft and archived).</li>
+ *   <li>{@code POST /admin/rules} - save a NEW VERSION of a rule as a draft (BUILDER JSON or DRL).
+ *       A bad rule is rejected (400); the live engine is not changed by a save.</li>
+ *   <li>{@code GET  /admin/rules/{ruleName}/versions} - version history, newest first.</li>
+ *   <li>{@code POST /admin/rules/{ruleName}/versions/{version}/activate} - make that version the
+ *       live one (release or rollback); the rule base reloads.</li>
+ *   <li>{@code DELETE /admin/rules/{ruleName}} - deactivate a rule (all versions archived).</li>
  *   <li>{@code GET  /admin/rules/fields?flow=FLOW} - the field catalog the builder dropdowns use,
  *       scoped to the flow plus the shared COMMON fields.</li>
  * </ul>
@@ -68,6 +71,18 @@ public class RuleAdminController {
     @PostMapping("/preview")
     public RulePreviewResponse preview(@RequestBody BuilderRuleSpec spec) {
         return ruleAdminService.preview(spec);
+    }
+
+    /** All versions of a rule (DRL / spec, status, who / when), newest first. */
+    @GetMapping("/{ruleName}/versions")
+    public List<RuleDefinition> versions(@PathVariable String ruleName) {
+        return ruleAdminService.versions(ruleName);
+    }
+
+    /** Make one version the live one (release a draft or roll back); the rule base reloads. */
+    @PostMapping("/{ruleName}/versions/{version}/activate")
+    public RuleDefinition activate(@PathVariable String ruleName, @PathVariable int version) {
+        return ruleAdminService.activate(ruleName, version);
     }
 
     @DeleteMapping("/{ruleName}")

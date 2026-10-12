@@ -1,8 +1,12 @@
 package leads.ruleengine.core.service;
 
 import leads.ruleengine.core.context.GlobalContext;
+import org.kie.api.event.rule.AfterMatchFiredEvent;
+import org.kie.api.event.rule.DefaultAgendaEventListener;
 import org.kie.api.runtime.KieSession;
 import org.kie.api.runtime.rule.AgendaGroup;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
 
 import java.util.List;
@@ -27,6 +31,8 @@ import java.util.List;
  */
 @Service
 public class RuleExecutionService {
+
+    private static final Logger log = LoggerFactory.getLogger(RuleExecutionService.class);
 
     private final RuleBaseProvider ruleBaseProvider;
     private final DecisionFlowResolver flowResolver;
@@ -59,6 +65,19 @@ public class RuleExecutionService {
                 } catch (RuntimeException ignored) {
                     // DRL did not declare the global - nothing to inject.
                 }
+            }
+
+            if (log.isDebugEnabled()) {
+                // Which rule VERSION fired - the hook a decision log can use to record the exact
+                // rule text that was live for this request.
+                session.addEventListener(new DefaultAgendaEventListener() {
+                    @Override
+                    public void afterMatchFired(AfterMatchFiredEvent event) {
+                        String drlRule = event.getMatch().getRule().getName();
+                        log.debug("Flow {}: fired '{}' ({})", flow, drlRule, ruleBaseProvider.sourceOf(drlRule)
+                                .map(ref -> ref.ruleName() + " v" + ref.version()).orElse("version unknown"));
+                    }
+                });
             }
 
             session.insert(fact);

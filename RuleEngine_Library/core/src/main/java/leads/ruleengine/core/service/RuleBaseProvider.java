@@ -14,8 +14,15 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Component;
 
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
+import java.util.Optional;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 /**
  * Owns the live Drools rule base and rebuilds it from the database at RUNTIME.
@@ -49,6 +56,13 @@ public class RuleBaseProvider {
 
     private volatile KieContainer container;
 
+    /** DRL rule name -> the stored rule version it came from, for the rules in {@link #container}. */
+    private volatile Map<String, RuleVersionRef> firedRuleIndex = Map.of();
+
+    /** {@code rule "Name"}, {@code rule 'Name'} or {@code rule Name} at the start of a line. */
+    private static final Pattern DRL_RULE_NAME =
+            Pattern.compile("^\\s*rule\\s+(?:\"([^\"]+)\"|'([^']+)'|(\\S+))", Pattern.MULTILINE);
+
     public RuleBaseProvider(RuleDefinitionRepository ruleDefinitionRepository) {
         this.ruleDefinitionRepository = ruleDefinitionRepository;
     }
@@ -64,21 +78,66 @@ public class RuleBaseProvider {
     }
 
     /**
-     * Rebuild the rule base from all active rules and swap it in atomically.
-     * Called at startup and after every successful rule save/delete.
+     * Rebuild the rule base from the ACTIVE version of each rule and swap it in atomically.
+     * Called at startup and after every activation / delete. Draft and archived versions are
+     * never compiled into the live rule base.
      */
     public synchronized void reload() {
-        List<RuleDefinition> active = ruleDefinitionRepository.findByActiveTrue();
+        List<RuleDefinition> active = liveVersions(ruleDefinitionRepository.findByActiveTrue());
         if (active.isEmpty()) {
-            log.warn("No active rules - rule base is empty. Rules will fire nothing until one is saved.");
+            log.warn("No active rules - rule base is empty. Rules will fire nothing until one is activated.");
         }
         KieContainer fresh = build(active);
         KieContainer old = this.container;
         this.container = fresh;
+        this.firedRuleIndex = indexDrlRuleNames(active);
         if (old != null) {
             old.dispose();
         }
         log.info("Rule base reloaded from {} active rule(s).", active.size());
+    }
+
+    /**
+     * Which stored rule version a fired DRL rule came from (e.g. for decision logs), looked up by
+     * the name in the DRL ({@code rule "..."}). Empty if the name is unknown to the live rule base.
+     */
+    public Optional<RuleVersionRef> sourceOf(String drlRuleName) {
+        return Optional.ofNullable(firedRuleIndex.get(drlRuleName));
+    }
+
+    /**
+     * Defensive: exactly one version per rule name may be live. The database enforces this with a
+     * unique index; if a schema without it ever holds two active rows for a name, keep only the
+     * newest so the live set is deterministic, and log it.
+     */
+    private List<RuleDefinition> liveVersions(List<RuleDefinition> rows) {
+        Map<String, RuleDefinition> newestPerName = new LinkedHashMap<>();
+        for (RuleDefinition r : rows) {
+            if (!r.isActive()) {
+                continue;
+            }
+            RuleDefinition seen = newestPerName.get(r.getRuleName());
+            if (seen != null) {
+                log.error("Rule '{}' has more than one active version (v{} and v{}); using the newest.",
+                        r.getRuleName(), seen.getVersion(), r.getVersion());
+            }
+            if (seen == null || r.getVersion() > seen.getVersion()) {
+                newestPerName.put(r.getRuleName(), r);
+            }
+        }
+        return new ArrayList<>(newestPerName.values());
+    }
+
+    private Map<String, RuleVersionRef> indexDrlRuleNames(List<RuleDefinition> rules) {
+        Map<String, RuleVersionRef> index = new HashMap<>();
+        for (RuleDefinition rule : rules) {
+            Matcher m = DRL_RULE_NAME.matcher(rule.getDrlText() == null ? "" : rule.getDrlText());
+            while (m.find()) {
+                String name = m.group(1) != null ? m.group(1) : m.group(2) != null ? m.group(2) : m.group(3);
+                index.put(name, new RuleVersionRef(rule.getRuleName(), rule.getVersion()));
+            }
+        }
+        return Map.copyOf(index);
     }
 
     /**

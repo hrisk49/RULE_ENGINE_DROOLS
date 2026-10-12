@@ -5,6 +5,7 @@ import leads.ruleengine.core.dto.BuilderRuleSpec;
 import leads.ruleengine.core.dto.RuleDefinitionRequest;
 import leads.ruleengine.core.dto.RulePreviewResponse;
 import leads.ruleengine.core.exception.RuleCompilationException;
+import leads.ruleengine.core.exception.RuleNotFoundException;
 import leads.ruleengine.core.model.RuleDefinition;
 import leads.ruleengine.core.repository.RuleDefinitionRepository;
 import org.slf4j.Logger;
@@ -16,7 +17,14 @@ import java.util.ArrayList;
 import java.util.List;
 
 /**
- * Manages stored rules ({@code RULE_DEFINITION}): save/replace, deactivate, list.
+ * Manages stored rules ({@code RULE_DEFINITION}) as VERSIONS: save a draft, activate a version,
+ * deactivate a rule, list.
+ *
+ * <p><b>Versioning:</b> every save inserts a new, immutable row (ruleName, version), numbered
+ * per rule name. A new version is a {@code DRAFT} and is <i>not</i> live; it goes live only through
+ * {@link #activate(String, int)}, which makes it the single active version of its rule name and
+ * archives the previous one. Rolling back is just activating an older version. Saving therefore
+ * never changes live behaviour on its own.</p>
  *
  * <p><b>Two source types:</b>
  * <ul>
@@ -26,9 +34,10 @@ import java.util.List;
  *   <li>{@code DRL} - the payload carries hand-written {@code drl}; it is stored as-is with no JSON.</li>
  * </ul>
  *
- * <p><b>Validate-before-swap:</b> on save the candidate rule is compiled together with the other
- * active rules FIRST. Only if the whole set compiles is the row saved and the rule base reloaded.
- * A rule with a syntax error is rejected and the running engine is untouched.</p>
+ * <p><b>Validate-before-swap:</b> a version is compiled together with the other live rules
+ * before it is saved (so a broken draft is rejected up front) and again before it is activated.
+ * Only after a successful activation is the rule base reloaded; a rule that does not compile
+ * never reaches the running engine.</p>
  *
  * @author K M Farhat Snigdah
  */
@@ -50,63 +59,128 @@ public class RuleAdminService {
     }
 
     /**
-     * Create or replace a rule by name. Generates DRL from JSON for BUILDER rules, validates the
-     * resulting active set before it is persisted, then reloads the rule base.
+     * Save a new version of a rule as a DRAFT (version = newest + 1, or 1 for a new rule).
+     * Generates DRL from JSON for BUILDER rules and checks that it would compile alongside the
+     * live rules. The live rule base is not touched - activate the version to apply it.
      */
     @Transactional
     public RuleDefinition save(RuleDefinitionRequest request) {
-        RuleDefinition entity = ruleDefinitionRepository.findByRuleName(request.ruleName())
-                .orElseGet(RuleDefinition::new);
+        List<RuleDefinition> versions = ruleDefinitionRepository.findByRuleNameOrderByVersionDesc(request.ruleName());
+        RuleDefinition newest = versions.isEmpty() ? null : versions.get(0);
 
-        entity.setRuleName(request.ruleName());
-        entity.setAgendaGroup(request.agendaGroup());
+        // The stage (agenda group) is part of a rule's identity across its versions.
+        if (newest != null && !newest.getAgendaGroup().equals(request.agendaGroup())) {
+            throw new IllegalArgumentException("Rule '" + request.ruleName() + "' belongs to agenda group '"
+                    + newest.getAgendaGroup() + "'; a new version cannot move it to '" + request.agendaGroup()
+                    + "'. Create a rule with a new name instead.");
+        }
+
+        RuleDefinition draft = new RuleDefinition();
+        draft.setRuleName(request.ruleName());
+        draft.setAgendaGroup(request.agendaGroup());
 
         String sourceType = request.sourceType() == null
                 ? RuleDefinition.SOURCE_DRL
                 : request.sourceType().trim().toUpperCase();
-        entity.setSourceType(sourceType);
+        draft.setSourceType(sourceType);
 
         if (RuleDefinition.SOURCE_BUILDER.equals(sourceType)) {
             if (isBlank(request.sourceJson())) {
                 throw new IllegalArgumentException("sourceJson is required when sourceType is BUILDER.");
             }
-            entity.setSourceJson(request.sourceJson());
-            entity.setDrlText(drlGenerator.fromJson(request.sourceJson()));
+            draft.setSourceJson(request.sourceJson());
+            draft.setDrlText(drlGenerator.fromJson(request.sourceJson()));
         } else {
             if (isBlank(request.drl())) {
                 throw new IllegalArgumentException("drl is required when sourceType is DRL.");
             }
-            entity.setSourceJson(null);
-            entity.setDrlText(request.drl());
+            draft.setSourceJson(null);
+            draft.setDrlText(request.drl());
         }
 
-        entity.setActive(true);
-        entity.setStatus("ACTIVE");
-        entity.setVersion(entity.getVersion() == null ? 1 : entity.getVersion() + 1);
-        entity.setCreatedBy(request.createdBy());
-        entity.setUpdatedAt(LocalDateTime.now());
+        LocalDateTime now = LocalDateTime.now();
+        draft.setVersion(newest == null ? 1 : newest.getVersion() + 1);
+        draft.setStatus(RuleDefinition.STATUS_DRAFT);
+        draft.setActive(false);
+        draft.setCreatedBy(request.createdBy());
+        draft.setCreatedAt(now);
+        draft.setUpdatedAt(now);
 
-        // Compile the full active set WITH this candidate before committing anything.
-        ruleBaseProvider.validate(candidateActiveSet(entity));
+        // Reject a version that could never be activated: compile it as if it replaced the live one.
+        ruleBaseProvider.validate(candidateActiveSet(draft));
 
-        RuleDefinition saved = ruleDefinitionRepository.save(entity);
-        ruleBaseProvider.reload();
-        log.info("Rule '{}' saved (type {}, version {}); rule base reloaded.",
-                saved.getRuleName(), saved.getSourceType(), saved.getVersion());
+        RuleDefinition saved = ruleDefinitionRepository.save(draft);
+        log.info("Rule '{}' v{} saved as DRAFT (type {}); live rule base unchanged until it is activated.",
+                saved.getRuleName(), saved.getVersion(), saved.getSourceType());
         return saved;
     }
 
-    /** Deactivate a rule (soft delete) and reload the rule base. */
+    /**
+     * Make one version the live version of its rule: the previously active version (if any) is
+     * archived, this one becomes ACTIVE, and the rule base is reloaded. Works for any version -
+     * a draft (release) or an older archived one (rollback). Re-activating the live version is a no-op.
+     */
+    @Transactional
+    public RuleDefinition activate(String ruleName, int version) {
+        RuleDefinition target = ruleDefinitionRepository.findByRuleNameAndVersion(ruleName, version)
+                .orElseThrow(() -> new RuleNotFoundException("Rule '" + ruleName + "' has no version " + version + "."));
+        if (target.isActive()) {
+            return target;
+        }
+
+        // Compile the live set as it would look with this version in place, before changing anything.
+        ruleBaseProvider.validate(candidateActiveSet(target));
+
+        LocalDateTime now = LocalDateTime.now();
+        ruleDefinitionRepository.findByRuleNameAndActiveTrue(ruleName).ifPresent(current -> {
+            current.setActive(false);
+            current.setStatus(RuleDefinition.STATUS_ARCHIVED);
+            current.setUpdatedAt(now);
+            // Flush first: at most one active row per rule name (unique index), so the old one must
+            // be switched off in the database before the new one is switched on.
+            ruleDefinitionRepository.saveAndFlush(current);
+        });
+
+        target.setActive(true);
+        target.setStatus(RuleDefinition.STATUS_ACTIVE);
+        target.setUpdatedAt(now);
+        RuleDefinition saved = ruleDefinitionRepository.saveAndFlush(target);
+
+        ruleBaseProvider.reload();
+        log.info("Rule '{}' v{} activated; rule base reloaded.", ruleName, version);
+        return saved;
+    }
+
+    /** All versions of a rule, newest first (empty if the rule does not exist). */
+    public List<RuleDefinition> versions(String ruleName) {
+        return ruleDefinitionRepository.findByRuleNameOrderByVersionDesc(ruleName);
+    }
+
+    /**
+     * Deactivate a rule (soft delete): every version is archived, so the rule leaves the live rule
+     * base and drops out of the active list. Any version can still be re-activated later.
+     */
     @Transactional
     public void delete(String ruleName) {
-        ruleDefinitionRepository.findByRuleName(ruleName).ifPresent(rule -> {
-            rule.setActive(false);
-            rule.setStatus("INACTIVE");
-            rule.setUpdatedAt(LocalDateTime.now());
-            ruleDefinitionRepository.save(rule);
+        List<RuleDefinition> versions = ruleDefinitionRepository.findByRuleNameOrderByVersionDesc(ruleName);
+        if (versions.isEmpty()) {
+            return;
+        }
+        boolean wasLive = versions.stream().anyMatch(RuleDefinition::isActive);
+        LocalDateTime now = LocalDateTime.now();
+        for (RuleDefinition v : versions) {
+            if (v.isActive() || !RuleDefinition.STATUS_ARCHIVED.equals(v.getStatus())) {
+                v.setActive(false);
+                v.setStatus(RuleDefinition.STATUS_ARCHIVED);
+                v.setUpdatedAt(now);
+            }
+        }
+        ruleDefinitionRepository.saveAll(versions);
+        if (wasLive) {
             ruleBaseProvider.reload();
-            log.info("Rule '{}' deactivated; rule base reloaded.", ruleName);
-        });
+        }
+        log.info("Rule '{}' deactivated ({} version(s) archived){}.", ruleName, versions.size(),
+                wasLive ? "; rule base reloaded" : "");
     }
 
     /**
@@ -133,8 +207,13 @@ public class RuleAdminService {
         }
     }
 
+    /**
+     * Every version row (live, draft and archived), grouped by rule name, newest first. Clients
+     * that only want live rules filter on {@code active}; the builder UI uses the rest for history
+     * and "draft pending" indicators.
+     */
     public List<RuleDefinition> list() {
-        return ruleDefinitionRepository.findByActiveTrue();   // live rules only; soft-deleted are hidden
+        return ruleDefinitionRepository.findAllByOrderByRuleNameAscVersionDesc();
     }
 
     /**

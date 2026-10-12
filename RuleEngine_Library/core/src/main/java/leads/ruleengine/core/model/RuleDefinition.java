@@ -8,6 +8,7 @@ import jakarta.persistence.Id;
 import jakarta.persistence.Lob;
 import jakarta.persistence.SequenceGenerator;
 import jakarta.persistence.Table;
+import jakarta.persistence.UniqueConstraint;
 
 import java.time.LocalDateTime;
 
@@ -38,7 +39,8 @@ import java.time.LocalDateTime;
  * @author K M Farhat Snigdah
  */
 @Entity
-@Table(name = "RULE_DEFINITION")
+@Table(name = "RULE_DEFINITION",
+        uniqueConstraints = @UniqueConstraint(name = "UK_RULE_DEFINITION_NAME_VER", columnNames = {"RULE_NAME", "VERSION_NO"}))
 public class RuleDefinition {
 
     /** Rule was hand-written in DRL by a developer. {@code sourceJson} is null. */
@@ -46,13 +48,26 @@ public class RuleDefinition {
     /** Rule was authored in the Visual Rule Builder. {@code drlText} is generated from {@code sourceJson}. */
     public static final String SOURCE_BUILDER = "BUILDER";
 
+    // ---- version lifecycle ----
+    // Every save inserts a new immutable row (RULE_NAME, VERSION_NO). Exactly one version per
+    // rule name is ACTIVE (active = true) - only that one is compiled into the live rule base.
+    /** Saved but not live; becomes live only through an explicit activation. */
+    public static final String STATUS_DRAFT = "DRAFT";
+    /** The live version of its rule name (active = true). */
+    public static final String STATUS_ACTIVE = "ACTIVE";
+    /** A former live version, a superseded draft, or a deleted rule. Can be re-activated (rollback). */
+    public static final String STATUS_ARCHIVED = "ARCHIVED";
+
     @Id
     @GeneratedValue(strategy = GenerationType.SEQUENCE, generator = "rule_definition_seq")
     @SequenceGenerator(name = "rule_definition_seq", sequenceName = "RULE_DEFINITION_SEQ", allocationSize = 1)
     private Long id;
 
-    /** Human-readable rule name, unique. Also used as the DRL resource name when compiling. */
-    @Column(name = "RULE_NAME", nullable = false, unique = true, length = 255)
+    /**
+     * Human-readable rule name - the identity of a rule across its versions (unique together with
+     * {@code VERSION_NO}). Also used as the DRL resource name when compiling the active version.
+     */
+    @Column(name = "RULE_NAME", nullable = false, length = 255)
     private String ruleName;
 
     /** The single group this rule belongs to (e.g. COMMON, TRANSFER, LOAN). */
@@ -73,26 +88,30 @@ public class RuleDefinition {
     @Column(name = "DRL_TEXT", nullable = false)
     private String drlText;
 
-    /** Bumped on every successful re-save of the same rule name. */
+    /** Version number within the rule name: 1, 2, 3 … (each save creates the next one). */
     @Column(name = "VERSION_NO", nullable = false)
     private Integer version = 1;
 
-    /**
-     * Simple lifecycle label. Defaults to {@code ACTIVE}. Kept as a plain string so a fuller
-     * maker-checker lifecycle (DRAFT/APPROVED/RETIRED...) can be layered on later without a
-     * schema change - but nothing heavier is built now.
-     */
+    /** {@link #STATUS_DRAFT}, {@link #STATUS_ACTIVE} or {@link #STATUS_ARCHIVED}. */
     @Column(name = "STATUS", nullable = false, length = 20)
-    private String status = "ACTIVE";
+    private String status = STATUS_DRAFT;
 
-    /** Only active rules are compiled into the running rule base. Delete = deactivate. */
+    /**
+     * True for the single live version of a rule name. Only active rows are compiled into the
+     * running rule base (see {@code RuleBaseProvider}); drafts and archived versions never are.
+     */
     @Column(name = "ACTIVE", nullable = false)
-    private boolean active = true;
+    private boolean active = false;
 
-    /** Who last saved the rule (optional - filled from the admin call when available). */
+    /** Who saved this version (optional - filled from the admin call when available). */
     @Column(name = "CREATED_BY", length = 100)
     private String createdBy;
 
+    /** When this version was saved. Never changes after insert. */
+    @Column(name = "CREATED_AT")
+    private LocalDateTime createdAt = LocalDateTime.now();
+
+    /** Last change to this row (creation, or activation / archiving). */
     @Column(name = "UPDATED_AT", nullable = false)
     private LocalDateTime updatedAt = LocalDateTime.now();
 
@@ -174,6 +193,14 @@ public class RuleDefinition {
 
     public void setCreatedBy(String createdBy) {
         this.createdBy = createdBy;
+    }
+
+    public LocalDateTime getCreatedAt() {
+        return createdAt;
+    }
+
+    public void setCreatedAt(LocalDateTime createdAt) {
+        this.createdAt = createdAt;
     }
 
     public LocalDateTime getUpdatedAt() {

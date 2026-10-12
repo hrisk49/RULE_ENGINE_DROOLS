@@ -6,19 +6,25 @@
 -- ============================ LIBRARY TABLES =================================
 
 CREATE SEQUENCE rule_definition_seq START WITH 1 INCREMENT BY 1;
+-- One row per rule VERSION: (rule_name, version_no) is unique, status DRAFT / ACTIVE / ARCHIVED,
+-- and at most one version per rule name is active (the live one). Existing databases: run
+-- db/migrations/001_rule_versioning.sql instead.
 CREATE TABLE rule_definition (
     id           BIGINT        NOT NULL PRIMARY KEY,
-    rule_name    VARCHAR(255)  NOT NULL UNIQUE,
+    rule_name    VARCHAR(255)  NOT NULL,
     agenda_group VARCHAR(255)  NOT NULL,
     source_type  VARCHAR(20)   NOT NULL DEFAULT 'DRL',
     source_json  TEXT,
     drl_text     TEXT          NOT NULL,
     version_no   INTEGER       NOT NULL DEFAULT 1,
-    status       VARCHAR(20)   NOT NULL DEFAULT 'ACTIVE',
-    active       BOOLEAN       NOT NULL DEFAULT TRUE,
+    status       VARCHAR(20)   NOT NULL DEFAULT 'DRAFT',
+    active       BOOLEAN       NOT NULL DEFAULT FALSE,
     created_by   VARCHAR(100),
-    updated_at   TIMESTAMP     NOT NULL
+    created_at   TIMESTAMP,
+    updated_at   TIMESTAMP     NOT NULL,
+    CONSTRAINT uk_rule_definition_name_ver UNIQUE (rule_name, version_no)
 );
+CREATE UNIQUE INDEX ux_rule_definition_one_active ON rule_definition (rule_name) WHERE active;
 CREATE INDEX ix_rule_definition_group ON rule_definition (agenda_group);
 
 CREATE SEQUENCE rule_field_catalog_seq START WITH 1 INCREMENT BY 1;

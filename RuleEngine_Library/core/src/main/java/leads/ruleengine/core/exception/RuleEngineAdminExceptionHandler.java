@@ -3,6 +3,7 @@ package leads.ruleengine.core.exception;
 import leads.ruleengine.core.controller.FlowAdminController;
 import leads.ruleengine.core.controller.RuleAdminController;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
+import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.validation.FieldError;
@@ -32,6 +33,27 @@ public class RuleEngineAdminExceptionHandler {
     @ExceptionHandler(RuleCompilationException.class)
     public ResponseEntity<Map<String, Object>> handleCompilation(RuleCompilationException ex) {
         return build(HttpStatus.BAD_REQUEST, ex.getMessage());
+    }
+
+    /** Unknown rule or version -> 404. */
+    @ExceptionHandler(RuleNotFoundException.class)
+    public ResponseEntity<Map<String, Object>> handleNotFound(RuleNotFoundException ex) {
+        return build(HttpStatus.NOT_FOUND, ex.getMessage());
+    }
+
+    /** Invalid save request (missing source, agenda group changed between versions, ...) -> 400. */
+    @ExceptionHandler(IllegalArgumentException.class)
+    public ResponseEntity<Map<String, Object>> handleBadRequest(IllegalArgumentException ex) {
+        return build(HttpStatus.BAD_REQUEST, ex.getMessage());
+    }
+
+    /**
+     * Two saves of the same rule raced for the same version number (UNIQUE ruleName + version),
+     * or a second version was activated concurrently (one active per rule) -> 409; retry.
+     */
+    @ExceptionHandler(DataIntegrityViolationException.class)
+    public ResponseEntity<Map<String, Object>> handleConflict(DataIntegrityViolationException ex) {
+        return build(HttpStatus.CONFLICT, "The rule was changed at the same time by another request - reload and try again.");
     }
 
     /** Missing flow/mapping row referenced from an admin call -> 400. */
